@@ -13,15 +13,25 @@ talks to it the way a typical real-time mobile online game does:
        - occasional action packets (shoot, use item, chat)
   4. Graceful disconnect
 
-Everything stays on the loopback interface (127.0.0.1), so no traffic
-leaves the machine. The script prints a Wireshark-style trace of every
-packet: direction, size, opcode, sequence number, and a hex preview of
-the payload.
+By default runs both sides on the loopback interface (127.0.0.1) so no
+traffic leaves the machine. With --server / --client the two halves can
+run on separate devices — e.g. server on a laptop, client on an iPhone
+in a-Shell, sending real UDP packets over Wi-Fi.
+
+The script prints a Wireshark-style trace of every packet: direction,
+size, opcode, sequence number, and a hex preview of the payload.
 
 Usage:
-    python3 mobile_game_packet_sim.py               # 15 second session
-    python3 mobile_game_packet_sim.py --seconds 30  # custom duration
-    python3 mobile_game_packet_sim.py --quiet       # suppress per-packet log
+    # Both sides on this machine (loopback):
+    python3 mobile_game_packet_sim.py                       # 15 s session
+    python3 mobile_game_packet_sim.py --seconds 30
+    python3 mobile_game_packet_sim.py --quiet
+
+    # Real traffic between two devices on the same Wi-Fi:
+    #   On the "server" machine (e.g. a laptop), listen on all interfaces:
+    python3 mobile_game_packet_sim.py --server --host 0.0.0.0 --port 40000
+    #   On the "client" (e.g. iPhone in a-Shell), point at the laptop's IP:
+    python3 mobile_game_packet_sim.py --client --host 192.168.1.42 --port 40000
 """
 
 from __future__ import annotations
@@ -351,42 +361,8 @@ class MobileClient:
 
 # ---------- Main -------------------------------------------------------------
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=0, help="0 = pick a free port")
-    ap.add_argument("--seconds", type=float, default=15.0)
-    ap.add_argument("--quiet", action="store_true", help="hide per-packet trace")
-    args = ap.parse_args()
-
-    # If port=0, bind once to grab a free port before starting the server.
-    if args.port == 0:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind((args.host, 0))
-        args.port = s.getsockname()[1]
-        s.close()
-
-    trace = Trace(quiet=args.quiet)
-    server = GameServer(args.host, args.port, trace)
-    server.start()
-    time.sleep(0.05)
-
-    print(f"# Mobile game packet simulation")
-    print(f"# server  = {args.host}:{args.port} (UDP, loopback only)")
-    print(f"# session = {args.seconds:.1f}s")
-    print(f"# header  = magic(2) ver(1) op(1) seq(2) session(4) = {HEADER_LEN} bytes")
-    print()
-
-    client = MobileClient((args.host, args.port), trace)
-    try:
-        client.connect()
-        client.play(args.seconds)
-    finally:
-        client.disconnect()
-        server.stop_flag.set()
-        server.join(timeout=1.0)
-
-    dur = time.time() - trace.t0
+def _print_summary(trace: Trace) -> None:
+    dur = max(time.time() - trace.t0, 1e-6)
     print()
     print(f"# Summary")
     print(f"#   duration        : {dur:.2f} s")
@@ -394,6 +370,104 @@ def main() -> None:
           f"{trace.bytes_sent / dur:.0f} B/s, {trace.sent / dur:.1f} pps)")
     print(f"#   packets received: {trace.recv:>5}  ({trace.bytes_recv} B, "
           f"{trace.bytes_recv / dur:.0f} B/s, {trace.recv / dur:.1f} pps)")
+
+
+def _run_server_only(host: str, port: int, trace: Trace) -> None:
+    server = GameServer(host, port, trace)
+    server.start()
+    print(f"# Mobile game packet simulation - SERVER MODE")
+    print(f"# listening on {host}:{port} (UDP)")
+    print(f"# header = magic(2) ver(1) op(1) seq(2) session(4) = {HEADER_LEN} bytes")
+    print(f"# Ctrl+C to stop")
+    print()
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop_flag.set()
+        server.join(timeout=1.0)
+        _print_summary(trace)
+
+
+def _run_client_only(host: str, port: int, seconds: float, trace: Trace) -> None:
+    print(f"# Mobile game packet simulation - CLIENT MODE")
+    print(f"# target  = {host}:{port} (UDP)")
+    print(f"# session = {seconds:.1f}s")
+    print(f"# header  = magic(2) ver(1) op(1) seq(2) session(4) = {HEADER_LEN} bytes")
+    print()
+    client = MobileClient((host, port), trace)
+    try:
+        client.connect()
+        client.play(seconds)
+    finally:
+        client.disconnect()
+        _print_summary(trace)
+
+
+def _run_both(host: str, port: int, seconds: float, trace: Trace) -> None:
+    # If port=0, grab a free one on this host first.
+    if port == 0:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind((host, 0))
+        port = s.getsockname()[1]
+        s.close()
+
+    server = GameServer(host, port, trace)
+    server.start()
+    time.sleep(0.05)
+
+    print(f"# Mobile game packet simulation - BOTH SIDES (loopback)")
+    print(f"# server  = {host}:{port} (UDP)")
+    print(f"# session = {seconds:.1f}s")
+    print(f"# header  = magic(2) ver(1) op(1) seq(2) session(4) = {HEADER_LEN} bytes")
+    print()
+
+    client = MobileClient((host, port), trace)
+    try:
+        client.connect()
+        client.play(seconds)
+    finally:
+        client.disconnect()
+        server.stop_flag.set()
+        server.join(timeout=1.0)
+        _print_summary(trace)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--server", action="store_true",
+                      help="run only the game server (listen for clients)")
+    mode.add_argument("--client", action="store_true",
+                      help="run only the mobile client (connect to a server)")
+    mode.add_argument("--both", action="store_true",
+                      help="run both sides on this machine (default)")
+    ap.add_argument("--host", default=None,
+                    help="server bind address (--server), or server IP to "
+                         "connect to (--client). Default: 0.0.0.0 for server, "
+                         "127.0.0.1 for client/both.")
+    ap.add_argument("--port", type=int, default=0,
+                    help="UDP port (0 = pick a free one, only valid for --both)")
+    ap.add_argument("--seconds", type=float, default=15.0,
+                    help="client session length (ignored for --server)")
+    ap.add_argument("--quiet", action="store_true", help="hide per-packet trace")
+    args = ap.parse_args()
+
+    trace = Trace(quiet=args.quiet)
+
+    if args.server:
+        host = args.host or "0.0.0.0"
+        port = args.port or 40000
+        _run_server_only(host, port, trace)
+    elif args.client:
+        host = args.host or "127.0.0.1"
+        port = args.port or 40000
+        _run_client_only(host, port, args.seconds, trace)
+    else:
+        host = args.host or "127.0.0.1"
+        _run_both(host, args.port, args.seconds, trace)
 
 
 if __name__ == "__main__":
