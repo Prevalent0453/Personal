@@ -177,7 +177,7 @@ class GameServer(threading.Thread):
             # (the sending side already emitted a trace line for this packet).
             try:
                 data, addr = self.sock.recvfrom(2048)
-                self._handle(data, addr)
+                self._dispatch(data, addr)
             except socket.timeout:
                 pass
             # Server tick: send snapshot ~10 Hz once a client has joined.
@@ -187,7 +187,7 @@ class GameServer(threading.Thread):
                 self.last_snapshot = now
         self.sock.close()
 
-    def _handle(self, data: bytes, addr: tuple[str, int]) -> None:
+    def _dispatch(self, data: bytes, addr: tuple[str, int]) -> None:
         magic, version, opcode, seq, session, payload = unpack(data)
         if magic != MAGIC or version != VERSION:
             return  # Silently drop malformed packets, as a real server would.
