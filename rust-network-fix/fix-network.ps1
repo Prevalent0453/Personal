@@ -13,16 +13,63 @@
            - lock 2.5 GbE adapters (Intel I225/I226, Realtek 8125) to 1 Gbps;
            - reset Winsock and the TCP/IP stack.
 
+    Only driver settings are changed - nothing is flashed or uninstalled. Before
+    any change the current settings are saved to rust-net-backup-*.json on the
+    Desktop; to undo everything:  run-as-admin.bat -Restore "<path to that json>"
+
     Run:  run-as-admin.bat   (or: powershell -ExecutionPolicy Bypass -File fix-network.ps1)
     Only collect the report, change nothing:  run-as-admin.bat -ReportOnly
 #>
-param([switch]$ReportOnly)
+param([switch]$ReportOnly, [string]$Restore)
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
     if ($ReportOnly) { $argList += '-ReportOnly' }
+    if ($Restore) { $argList += @('-Restore', "`"$((Resolve-Path $Restore).Path)`"") }
     Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
+    exit
+}
+
+$powerSettings = 'AllowComputerToTurnOffDevice', 'SelectiveSuspend', 'DeviceSleepOnDisconnect'
+
+# Registry key of the adapter under the Network class; holds PnPCapabilities.
+function Get-NicClassKey([string]$Guid) {
+    $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}'
+    Get-ChildItem $classKey -ErrorAction SilentlyContinue | Where-Object {
+        (Get-ItemProperty $_.PSPath -Name NetCfgInstanceId -ErrorAction SilentlyContinue).NetCfgInstanceId -eq $Guid
+    } | Select-Object -First 1
+}
+
+if ($Restore) {
+    $saved = Get-Content -Path $Restore -Raw | ConvertFrom-Json
+    $name = $saved.Adapter
+    Write-Host "Restoring settings of '$name' from $Restore"
+    foreach ($p in $saved.Advanced) {
+        $now = Get-NetAdapterAdvancedProperty -Name $name -RegistryKeyword $p.Keyword -ErrorAction SilentlyContinue
+        if ($now -and ((@($now.RegistryValue) -join ',') -ne (@($p.Value) -join ','))) {
+            Set-NetAdapterAdvancedProperty -Name $name -RegistryKeyword $p.Keyword -RegistryValue @($p.Value) -NoRestart
+            Write-Host "  [restored] $($p.Keyword) = $(@($p.Value) -join ',')"
+        }
+    }
+    foreach ($b in $saved.Bindings) {
+        if ($b.Enabled) { Enable-NetAdapterBinding -Name $name -ComponentID $b.ComponentID -ErrorAction SilentlyContinue }
+    }
+    foreach ($p in $saved.Power.PSObject.Properties) {
+        if ($p.Value -notin 'Enabled', 'Disabled') { continue }
+        $params = @{ Name = $name; $p.Name = $p.Value; ErrorAction = 'SilentlyContinue' }
+        Set-NetAdapterPowerManagement @params
+    }
+    if ($saved.NicKey) {
+        if ($null -eq $saved.PnPCapabilities) {
+            Remove-ItemProperty -Path $saved.NicKey -Name PnPCapabilities -ErrorAction SilentlyContinue
+        } else {
+            Set-ItemProperty -Path $saved.NicKey -Name PnPCapabilities -Value ([int]$saved.PnPCapabilities) -Type DWord
+        }
+    }
+    Restart-NetAdapter -Name $name -Confirm:$false
+    Write-Host 'Done, previous settings are back.' -ForegroundColor Green
+    Read-Host 'Press Enter to exit'
     exit
 }
 
@@ -79,7 +126,7 @@ Write-Host "  Active adapter: $name  [$($adapter.InterfaceDescription)]"
 Write-Section 'Physical adapters'
 Write-Table (Get-NetAdapter -Physical | Format-Table Name, InterfaceDescription, Status, LinkSpeed, MediaType, DriverVersion, DriverDate, DriverProvider -AutoSize)
 
-$driverDate = $null
+$driverDate = [datetime]::MinValue
 if ([datetime]::TryParse([string]$adapter.DriverDate, [ref]$driverDate) -and $driverDate -lt (Get-Date).AddYears(-2)) {
     Write-Host "  [!] Driver is from $($driverDate.ToString('yyyy-MM-dd')). Install the latest one from the motherboard/laptop vendor or Intel/Realtek site." -ForegroundColor Yellow
 }
@@ -134,12 +181,31 @@ if (-not (Ask '  Apply the safe fixes (power saving, EEE/Green Ethernet, Large S
     exit
 }
 
+$nicKey = Get-NicClassKey $adapter.InterfaceGuid
+$pm = Get-NetAdapterPowerManagement -Name $name -ErrorAction SilentlyContinue
+$power = [ordered]@{}
+foreach ($setting in $powerSettings) { if ($pm) { $power[$setting] = [string]$pm.$setting } }
+$backup = Join-Path $desktop ("rust-net-backup-{0:yyyyMMdd-HHmmss}.json" -f (Get-Date))
+[pscustomobject]@{
+    Adapter         = $name
+    Advanced        = @(Get-NetAdapterAdvancedProperty -Name $name -ErrorAction SilentlyContinue |
+        Where-Object RegistryKeyword |
+        ForEach-Object { [pscustomobject]@{ Keyword = $_.RegistryKeyword; Value = @($_.RegistryValue) } })
+    Bindings        = @($bindings | Select-Object ComponentID, Enabled)
+    Power           = $power
+    NicKey          = if ($nicKey) { $nicKey.PSPath } else { $null }
+    PnPCapabilities = if ($nicKey) { (Get-ItemProperty $nicKey.PSPath -Name PnPCapabilities -ErrorAction SilentlyContinue).PnPCapabilities } else { $null }
+} | ConvertTo-Json -Depth 4 | Set-Content -Path $backup -Encoding UTF8
+Write-Host "  Current settings saved to $backup" -ForegroundColor Green
+Write-Host "  To undo everything later: run-as-admin.bat -Restore `"$backup`""
+Write-Host ''
+
 $needRestart = $false
 
 # "Allow the computer to turn off this device to save power" and friends.
 $pmParams = (Get-Command Set-NetAdapterPowerManagement).Parameters
 $turnOffDisabled = $false
-foreach ($setting in 'AllowComputerToTurnOffDevice', 'SelectiveSuspend', 'DeviceSleepOnDisconnect') {
+foreach ($setting in $powerSettings) {
     if (-not $pmParams.ContainsKey($setting)) { continue }
     $params = @{ Name = $name; $setting = 'Disabled'; ErrorAction = 'Stop' }
     if ($pmParams.ContainsKey('NoRestart')) { $params.NoRestart = $true }
@@ -154,10 +220,6 @@ foreach ($setting in 'AllowComputerToTurnOffDevice', 'SelectiveSuspend', 'Device
 }
 if (-not $turnOffDisabled) {
     # Same checkbox via the registry (PnPCapabilities = 24), for older builds/drivers.
-    $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}'
-    $nicKey = Get-ChildItem $classKey -ErrorAction SilentlyContinue | Where-Object {
-        (Get-ItemProperty $_.PSPath -Name NetCfgInstanceId -ErrorAction SilentlyContinue).NetCfgInstanceId -eq $adapter.InterfaceGuid
-    } | Select-Object -First 1
     if ($nicKey) {
         Set-ItemProperty -Path $nicKey.PSPath -Name PnPCapabilities -Value 24 -Type DWord
         Write-Host '  [set] Allow the computer to turn off this device = off (registry)' -ForegroundColor Green
